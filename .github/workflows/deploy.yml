@@ -1,0 +1,97 @@
+name: Build POC2 (Next.js) and publish
+
+# Website code: jondoblados/poc @ poc2.  Content: jondoblados/poc @ main (content/ + data/, written from
+# Google Docs every 15 min by the POC1 workflow).  Output: GitHub Pages -> https://jon.doblados.net/ambsaas/
+on:
+  schedule:
+    - cron: "7,22,37,52 0-15 * * *"  # every 15 min 08:00-23:59 SGT, a few minutes after the Drive sync on main
+    - cron: "10 16 * * *"            # 00:10 SGT daily: always rebuild so future-dated posts go live
+  workflow_dispatch:                 # "Run workflow" button = publish now
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: jondoblados/poc
+  CODE_REF: poc2
+  CONTENT_REF: main
+  SITE_URL: "https://jon.doblados.net/ambsaas/"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.decide.outputs.deploy }}
+    steps:
+      - id: decide
+        name: Decide whether to build (skip if code and content are unchanged)
+        run: |
+          code=$(git ls-remote "https://github.com/$SOURCE_REPO" "refs/heads/$CODE_REF" | cut -f1)
+          content=$(git ls-remote "https://github.com/$SOURCE_REPO" "refs/heads/$CONTENT_REF" | cut -f1)
+          echo "code=$code" >> "$GITHUB_OUTPUT"; echo "content=$content" >> "$GITHUB_OUTPUT"
+          live=$(curl -fsS "${SITE_URL}build.json" 2>/dev/null || echo '{}')
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" != "10 16 * * *" ] \
+             && echo "$live" | grep -q "\"code\": *\"$code\"" && echo "$live" | grep -q "\"content\": *\"$content\""; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"; echo "No changes since the last deploy - skipping."
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out website code (poc2)
+        if: steps.decide.outputs.deploy == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ steps.decide.outputs.code }}
+          fetch-depth: 1
+
+      - name: Use the latest Google Drive content from main
+        if: steps.decide.outputs.deploy == 'true'
+        run: |
+          git fetch --depth=1 origin "${{ steps.decide.outputs.content }}"
+          rm -rf content data
+          git checkout FETCH_HEAD -- content data
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.decide.outputs.deploy == 'true'
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Build (next build, static export)
+        if: steps.decide.outputs.deploy == 'true'
+        env:
+          TZ: Asia/Singapore
+          BASE_PATH: /ambsaas
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: |
+          npm ci
+          npm run build
+          printf '{"code": "%s", "content": "%s", "built": "%s"}\n' \
+            "${{ steps.decide.outputs.code }}" "${{ steps.decide.outputs.content }}" "$(date -u +%FT%TZ)" > out/build.json
+
+      - name: Upload Pages artifact
+        if: steps.decide.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: out
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
